@@ -737,6 +737,8 @@ class HttpStream(layer.Layer):
             yield SendHttp(event, self.context.server)
             self.client_state = self.state_errored
 
+        had_response_before_hook = self.flow.response is not None
+
         if need_error_hook:
             # We don't want to trigger both a response hook and an error hook,
             # so we need to check if the response is done yet or not.
@@ -748,7 +750,39 @@ class HttpStream(layer.Layer):
 
         if isinstance(event, ResponseProtocolError):
             if self.client_state != self.state_errored:
-                yield SendHttp(event, self.context.client)
+                can_override_connect_failed = (
+                    event.code is ErrorCode.CONNECT_FAILED
+                    and self.server_state == self.state_wait_for_response_headers
+                    and not had_response_before_hook
+                    and self.flow.response is not None
+                )
+                if can_override_connect_failed:
+                    now = time.time()
+                    self.flow.response.timestamp_start = now
+                    self.flow.response.timestamp_end = now
+                    content = self.flow.response.raw_content
+                    done_after_headers = not (content or self.flow.response.trailers)
+                    yield SendHttp(
+                        ResponseHeaders(
+                            self.stream_id, self.flow.response, done_after_headers
+                        ),
+                        self.context.client,
+                    )
+                    if content:
+                        yield SendHttp(
+                            ResponseData(self.stream_id, content),
+                            self.context.client,
+                        )
+                    if self.flow.response.trailers:
+                        yield SendHttp(
+                            ResponseTrailers(
+                                self.stream_id, self.flow.response.trailers
+                            ),
+                            self.context.client,
+                        )
+                    yield SendHttp(ResponseEndOfMessage(self.stream_id), self.context.client)
+                else:
+                    yield SendHttp(event, self.context.client)
             self.server_state = self.state_errored
 
         self.flow.live = False
