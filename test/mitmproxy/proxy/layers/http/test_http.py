@@ -1273,6 +1273,113 @@ def test_http_server_aborts(tctx, stream):
     assert not flow().live
 
 
+def test_error_hook_response_override_connect_failed(tctx):
+    server = Placeholder(Server)
+    flow = Placeholder(HTTPFlow)
+
+    def set_override_response(f: HTTPFlow):
+        f.response = Response.make(
+            200,
+            b"Cached content",
+            {"Content-Type": "text/plain"},
+        )
+
+    assert (
+        Playbook(http.HttpLayer(tctx, HTTPMode.regular))
+        >> DataReceived(
+            tctx.client,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        << http.HttpRequestHeadersHook(flow)
+        >> reply()
+        << http.HttpRequestHook(flow)
+        >> reply()
+        << OpenConnection(server)
+        >> reply("Connection refused")
+        << http.HttpErrorHook(flow)
+        >> reply(side_effect=set_override_response)
+        << SendData(
+            tctx.client,
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"content-length: 14\r\n\r\n"
+            b"Cached content",
+        )
+    )
+    assert flow().response.status_code == 200
+    assert flow().response.content == b"Cached content"
+    assert flow().error.msg == "Connection refused"
+    assert not flow().live
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_error_hook_response_override_ignored_after_response_started(tctx, stream):
+    server = Placeholder(Server)
+    flow = Placeholder(HTTPFlow)
+    playbook = Playbook(http.HttpLayer(tctx, HTTPMode.regular))
+
+    def enable_streaming(f: HTTPFlow):
+        f.response.stream = True
+
+    def set_override_response(f: HTTPFlow):
+        f.response = Response.make(200, b"Fallback", {"Content-Type": "text/plain"})
+
+    assert (
+        playbook
+        >> DataReceived(
+            tctx.client,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        << http.HttpRequestHeadersHook(flow)
+        >> reply()
+        << http.HttpRequestHook(flow)
+        >> reply()
+        << OpenConnection(server)
+        >> reply(None)
+        << SendData(server, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        >> DataReceived(server, b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc")
+        << http.HttpResponseHeadersHook(flow)
+    )
+    if stream:
+        assert (
+            playbook
+            >> reply(side_effect=enable_streaming)
+            << SendData(
+                tctx.client,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc",
+            )
+        )
+    else:
+        assert playbook >> reply()
+
+    if stream:
+        assert (
+            playbook
+            >> ConnectionClosed(server)
+            << CloseConnection(server)
+            << http.HttpErrorHook(flow)
+            >> reply(side_effect=set_override_response)
+            << CloseConnection(tctx.client)
+        )
+    else:
+        assert (
+            playbook
+            >> ConnectionClosed(server)
+            << CloseConnection(server)
+            << http.HttpErrorHook(flow)
+            >> reply(side_effect=set_override_response)
+            << SendData(
+                tctx.client, BytesMatching(b"502 Bad Gateway.+peer closed connection")
+            )
+            << CloseConnection(tctx.client)
+        )
+
+    assert flow().response.status_code == 200
+    assert flow().response.content == b"Fallback"
+    assert "peer closed connection" in flow().error.msg
+    assert not flow().live
+
+
 @pytest.mark.parametrize(
     "when",
     [
