@@ -757,8 +757,9 @@ class HttpStream(layer.Layer):
                     and self.flow.response is not None
                 )
                 if can_override_connect_failed:
-                    self.flow.response.timestamp_start = time.time()
-                    self.flow.response.timestamp_end = time.time()
+                    now = time.time()
+                    self.flow.response.timestamp_start = now
+                    self.flow.response.timestamp_end = now
                     content = self.flow.response.raw_content
                     done_after_headers = not (content or self.flow.response.trailers)
                     yield SendHttp(
